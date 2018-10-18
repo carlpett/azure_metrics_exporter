@@ -41,24 +41,35 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 // Collect - collect results from Azure Montior API and create Prometheus metrics.
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	// Get metric values for all defined metrics
-	for _, target := range sc.C.Targets {
+	urls := make([]string, len(sc.C.Targets))
+	for idx, target := range sc.C.Targets {
 		metrics := []string{}
 		for _, metric := range target.Metrics {
 			metrics = append(metrics, metric.Name)
 		}
 		metricsStr := strings.Join(metrics, ",")
-		metricValueData, err := ac.getMetricValue(metricsStr, target)
-		if err != nil {
-			log.Printf("Failed to get metrics for target %s: %v", target.Resource, err)
+		urls[idx] = ac.getMetricURL(metricsStr, target)
+	}
+
+	result, err := ac.doBatchRequest(urls)
+	if err != nil {
+		log.Println("Failed to get metrics: %v", err)
+	}
+
+	for idx, resp := range result.Responses {
+		target := sc.C.Targets[idx] // Responses are returned in the same order as sent in
+		if resp.HttpStatusCode != 200 {
+			log.Println("Querying metrics API for %s got status code %d", target.Resource, resp.HttpStatusCode)
 			continue
 		}
+		metricValueData := resp.Content
 
 		if metricValueData.Value == nil {
-			log.Printf("Metric %v not found at target %v\n", metricsStr, target.Resource)
+			log.Printf("Metrics not found at target %v\n", target.Resource)
 			continue
 		}
 		if len(metricValueData.Value[0].Timeseries[0].Data) == 0 {
-			log.Printf("No metric data returned for metric %v at target %v\n", metricsStr, target.Resource)
+			log.Printf("No metric data returned for target %v\n", target.Resource)
 			continue
 		}
 

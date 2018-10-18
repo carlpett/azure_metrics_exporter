@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -62,6 +63,16 @@ type AzureMetricValueResponse struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// AzureBatchResponse contains the result of several get metrics requests
+type AzureBatchResponse struct {
+	Responses []struct {
+		HttpStatusCode int                      `json:"httpStatusCode"`
+		Headers        map[string]string        `json:"headers"`
+		Content        AzureMetricValueResponse `json:"content"`
+		ContentLength  int                      `json:"contentLength"`
+	} `json:"responses"`
 }
 
 // AzureClient represents our client to talk to the Azure api
@@ -150,6 +161,93 @@ func (ac *AzureClient) getMetricDefinitions() (map[string]AzureMetricDefinitionR
 		definitions[target.Resource] = def
 	}
 	return definitions, nil
+}
+
+type batchRequest struct {
+	Requests []batchURL `json:"requests"`
+}
+type batchURL struct {
+	RelativeURL string `json:"relativeUrl"`
+	Method      string `json:"httpMethod"`
+}
+
+func (ac *AzureClient) doBatchRequest(urls []string) (*AzureBatchResponse, error) {
+	const batchUrl = "https://management.azure.com/batch?api-version=2017-03-01" // "http://localhost:8080/batch?api-version=2017-03-01"
+	now := time.Now().UTC()
+	refreshAt := ac.accessTokenExpiresOn.Add(-10 * time.Minute)
+	if now.After(refreshAt) {
+		err := ac.getAccessToken()
+		if err != nil {
+			return nil, fmt.Errorf("Error refreshing access token: %v", err)
+		}
+	}
+
+	batch := batchRequest{make([]batchURL, len(urls))}
+	for idx, url := range urls {
+		batch.Requests[idx] = batchURL{url, "GET"}
+	}
+	var reqBody bytes.Buffer
+	enc := json.NewEncoder(&reqBody)
+	enc.SetEscapeHTML(false) // Azure does not handle the &:s becoming \u0026 in the urls
+	err := enc.Encode(batch)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", batchUrl, &reqBody)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+ac.accessToken)
+
+	resp, err := ac.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Error: %v", err)
+	}
+
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Unable to query metrics API with status code: %d", resp.StatusCode)
+	}
+
+	respBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading body of response: %v", err)
+	}
+
+	var data AzureBatchResponse
+	err = json.Unmarshal(respBody, &data)
+	if err != nil {
+		return nil, fmt.Errorf("Error unmarshalling response body: %v", err)
+	}
+
+	return &data, nil
+}
+
+func (ac *AzureClient) getMetricURL(metricNames string, target config.Target) string {
+	const apiVersion = "2018-01-01"
+	metricValueEndpoint := fmt.Sprintf("/subscriptions/%s%s/providers/microsoft.insights/metrics", sc.C.Credentials.SubscriptionID, target.Resource)
+	endTime, startTime := GetTimes()
+
+	values := url.Values{}
+	if metricNames != "" {
+		values.Add("metricnames", metricNames)
+	}
+	if len(target.Aggregations) > 0 {
+		values.Add("aggregation", strings.Join(target.Aggregations, ","))
+	} else {
+		values.Add("aggregation", "Total,Average,Minimum,Maximum")
+	}
+	values.Add("timespan", fmt.Sprintf("%s/%s", startTime, endTime))
+	values.Add("api-version", apiVersion)
+
+	url := url.URL{
+		Path:     metricValueEndpoint,
+		RawQuery: values.Encode(),
+	}
+
+	return url.String()
 }
 
 func (ac *AzureClient) getMetricValue(metricNames string, target config.Target) (AzureMetricValueResponse, error) {
